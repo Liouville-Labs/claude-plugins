@@ -1,0 +1,454 @@
+#!/usr/bin/env node
+// biddle-sync: Biddle's hook for coding agents (Claude Code, Codex, Cursor). Spec 2026-11-03 2.2.2 and 4.4.
+//
+// At the end of an agent turn or session it reads the git state of the session's repository (branch names, head shas,
+// ahead and behind counts against the default branch, commit dates) and sends one report_local_state call to Biddle,
+// which keeps it on its person's private action-item list. It never reads the transcript (transcript_path is never
+// opened), file contents, diffs, commit messages or paths, and sends nothing for a repository whose origin is not
+// github.com or that Biddle refused (cached a day in skip.json). As a hook it never fails the agent: it returns at once
+// with exit 0, and the collection and the request run in a detached child (git within 2 s, the request within 5 s).
+//
+//   biddle-sync --client claude-code|codex|cursor   the hook (reads the hook's JSON on stdin)
+//   biddle-sync --check [--cwd <dir>]               what it would send from here, sent now, and Biddle's answer
+//   biddle-sync --login                             save a personal access token (asked for with the input hidden)
+//
+// Node 18 or later, no dependencies. Written with dynamic imports so it runs as CommonJS or as ESM.
+
+const VERSION = '0.1.0';
+const DEFAULT_API = 'https://api.askbiddle.ai';
+const GIT_BUDGET_MS = 2000;
+const NETWORK_TIMEOUT_MS = 5000;
+const SKIP_MS = 24 * 3600 * 1000;
+const BACKOFF_MS = 15 * 60 * 1000;
+const SAME_SNAPSHOT_MS = 15 * 60 * 1000;
+const NOTICE_EVERY_MS = 24 * 3600 * 1000;
+const MAX_BRANCHES = 100;
+const MAX_BRANCH_CHARS = 200;
+const MAX_STDIN_BYTES = 1024 * 1024;
+const TOKEN_PATTERN = /^bdl_pat_[A-Za-z0-9_-]{43}$/;
+const CLIENTS = ['claude-code', 'codex', 'cursor', 'other'];
+
+const WORDS = {
+  en: {
+    stale: (latest) => `Biddle: biddle-sync ${latest} is out (you have ${VERSION}). Update with: claude plugin update biddle@askbiddle`,
+    staleOther: (latest) => `biddle-sync ${latest} is out (you have ${VERSION}). Update with: npx @askbiddle/agent-setup@latest`,
+    noToken: 'No token yet. Make one in Biddle Settings > Agent access with "Action items" checked, then run: biddle-sync --login',
+    badMode: (p) => `${p} can be read by other users of this computer; run: chmod 600 "${p}"`,
+    tokenOk: (p) => `Token: ${p}`,
+    noRepo: 'Not inside a git repository.',
+    notGithub: 'This repository\'s origin is not on github.com, so nothing is sent from it.',
+    noBase: (d) => `No origin/${d} or local ${d} branch to compare with; run git fetch.`,
+    repo: (r, d, n) => `Repository: ${r} (default branch ${d}), ${n} branch${n === 1 ? '' : 'es'} with commits not in ${d}`,
+    sent: (o) => o.unchanged ? 'Biddle: up to date (nothing changed since the last snapshot).' : `Biddle: ${o.created ?? 0} item(s) added, ${o.updated ?? 0} updated. ${o.url ?? ''}`.trim(),
+    unauthorized: 'Biddle refused the token (expired or revoked). Make a new one and run: biddle-sync --login',
+    scope: 'This token cannot write action items. Make a token with "Action items" checked and run: biddle-sync --login',
+    off: 'Action-item tracking is off for you. Turn on "Track my sessions\' action items" in Biddle Settings > Agent access.',
+    refused: 'Biddle refused this repository: it is not in your workspace\'s GitHub installation.',
+    denied: (why) => `Biddle refused agent access: ${why}`,
+    failed: (why) => `Could not reach Biddle: ${why}`,
+    loginPrompt: 'Paste your Biddle token (input hidden): ',
+    loginBad: 'That is not a Biddle personal access token (bdl_pat_...).',
+    loginSaved: (p) => `Saved to ${p}. Run biddle-sync --check in a repository to test it.`,
+    usage: 'Usage: biddle-sync --client claude-code|codex|cursor (as a hook) | --check [--cwd <dir>] | --login | --version',
+  },
+  ko: {
+    stale: (latest) => `Biddle: biddle-sync ${latest}이 나왔어요(지금 ${VERSION}). 업데이트: claude plugin update biddle@askbiddle`,
+    staleOther: (latest) => `biddle-sync ${latest}이 나왔어요(지금 ${VERSION}). 업데이트: npx @askbiddle/agent-setup@latest`,
+    noToken: '토큰이 아직 없어요. Biddle 설정 > 에이전트 접근에서 "작업 항목"을 체크해 토큰을 만든 뒤 실행하세요: biddle-sync --login',
+    badMode: (p) => `${p} 파일을 이 컴퓨터의 다른 사용자도 읽을 수 있어요. 실행하세요: chmod 600 "${p}"`,
+    tokenOk: (p) => `토큰: ${p}`,
+    noRepo: 'git 저장소 안이 아니에요.',
+    notGithub: '이 저장소의 origin이 github.com이 아니라서 여기서는 아무것도 보내지 않아요.',
+    noBase: (d) => `비교할 origin/${d}나 로컬 ${d} 브랜치가 없어요. git fetch를 실행하세요.`,
+    repo: (r, d, n) => `저장소: ${r} (기본 브랜치 ${d}), ${d}에 없는 커밋이 있는 브랜치 ${n}개`,
+    sent: (o) => o.unchanged ? 'Biddle: 최신 상태예요(지난 스냅샷 이후 바뀐 게 없어요).' : `Biddle: 항목 ${o.created ?? 0}개 추가, ${o.updated ?? 0}개 갱신. ${o.url ?? ''}`.trim(),
+    unauthorized: 'Biddle이 토큰을 거부했어요(만료 또는 취소). 새로 만든 뒤 실행하세요: biddle-sync --login',
+    scope: '이 토큰으로는 작업 항목을 쓸 수 없어요. "작업 항목"을 체크한 토큰을 만든 뒤 실행하세요: biddle-sync --login',
+    off: '작업 항목 추적이 꺼져 있어요. Biddle 설정 > 에이전트 접근에서 "내 세션의 작업 항목 추적"을 켜세요.',
+    refused: 'Biddle이 이 저장소를 거부했어요. 워크스페이스의 GitHub 설치에 없는 저장소예요.',
+    denied: (why) => `Biddle이 에이전트 접근을 거부했어요: ${why}`,
+    failed: (why) => `Biddle에 연결하지 못했어요: ${why}`,
+    loginPrompt: 'Biddle 토큰을 붙여넣으세요(입력은 보이지 않아요): ',
+    loginBad: 'Biddle 개인 액세스 토큰(bdl_pat_...)이 아니에요.',
+    loginSaved: (p) => `${p}에 저장했어요. 저장소에서 biddle-sync --check로 확인하세요.`,
+    usage: '사용법: biddle-sync --client claude-code|codex|cursor (훅) | --check [--cwd <dir>] | --login | --version',
+  },
+};
+
+function words() {
+  const lang = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || '';
+  return lang.toLowerCase().startsWith('ko') ? WORDS.ko : WORDS.en;
+}
+
+function argOf(args, name) {
+  const i = args.indexOf(name);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+async function main() {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+  const crypto = await import('node:crypto');
+  const cp = await import('node:child_process');
+  const args = process.argv.slice(2);
+  const w = words();
+
+  const configDir = process.env.BIDDLE_CONFIG_DIR
+    || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'biddle');
+  const credentialsPath = path.join(configDir, 'credentials');
+  const statePath = path.join(configDir, 'state.json');
+  const skipPath = path.join(configDir, 'skip.json');
+
+  function readJson(p) {
+    try {
+      const v = JSON.parse(fs.readFileSync(p, 'utf8'));
+      return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : {};
+    } catch {
+      return {};
+    }
+  }
+  function writeJson(p, value) {
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const tmp = `${p}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    fs.renameSync(tmp, p);
+  }
+  function updateState(patch) {
+    writeJson(statePath, { ...readJson(statePath), ...patch });
+  }
+
+  /** The saved token, or why there is none. A file other users can read is refused (the ssh rule). */
+  function token() {
+    let st;
+    try {
+      st = fs.statSync(credentialsPath);
+    } catch {
+      return { error: 'none' };
+    }
+    if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) return { error: 'mode' };
+    const t = readJson(credentialsPath).token;
+    return typeof t === 'string' && TOKEN_PATTERN.test(t) ? { token: t } : { error: 'none' };
+  }
+
+  function apiBase() {
+    const raw = process.env.BIDDLE_API_URL || DEFAULT_API;
+    try {
+      const u = new URL(raw);
+      const loopback = u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]';
+      if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) return DEFAULT_API;
+      return u.origin;
+    } catch {
+      return DEFAULT_API;
+    }
+  }
+
+  /** owner/name of a github.com remote URL, or null (any other host sends nothing). */
+  function githubRepo(url) {
+    const m = /^(?:git@github\.com:|(?:ssh:\/\/)?git@github\.com(?::22)?\/|(?:https?|git):\/\/(?:[^@/]+@)?github\.com(?::443)?\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(url.trim());
+    return m ? `${m[1]}/${m[2]}` : null;
+  }
+
+  /** The repository's state (names, shas, counts, dates; nothing else), or a reason it sends nothing. */
+  async function collect(cwd) {
+    // BIDDLE_SYNC_GIT_BUDGET_MS: a longer budget for a slow machine (and the tests); the default is the spec's 2 s.
+    const budget = Number.parseInt(process.env.BIDDLE_SYNC_GIT_BUDGET_MS || '', 10);
+    const deadline = Date.now() + (budget > 0 && budget <= 60000 ? budget : GIT_BUDGET_MS);
+    const git = (gitArgs, dir) => new Promise((resolve) => {
+      const left = deadline - Date.now();
+      if (left <= 0) return resolve(null);
+      cp.execFile('git', ['-C', dir, ...gitArgs], {
+        timeout: left, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' },
+      }, (err, stdout) => resolve(err ? null : String(stdout)));
+    });
+    const top = (await git(['rev-parse', '--show-toplevel'], cwd))?.trim();
+    if (!top) return { skip: 'no_repo' };
+    const remote = await git(['remote', 'get-url', 'origin'], top);
+    const repo = remote ? githubRepo(remote) : null;
+    if (!repo) return { skip: 'not_github' };
+    const originHead = (await git(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], top))?.trim();
+    const defaultBranch = originHead && originHead.startsWith('origin/') ? originHead.slice('origin/'.length) : 'main';
+    const bases = (await git(['for-each-ref', '--format=%(refname)', `refs/remotes/origin/${defaultBranch}`, `refs/heads/${defaultBranch}`], top) || '')
+      .split('\n').filter(Boolean);
+    const base = bases.find((r) => r.startsWith('refs/remotes/')) || bases[0];
+    if (!base) return { skip: 'no_base', repo, default_branch: defaultBranch };
+    const refs = await git(['for-each-ref', `--no-merged=${base}`, '--sort=-committerdate',
+      '--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(committerdate:iso-strict)', 'refs/heads'], top);
+    if (refs === null) return { skip: 'git_failed', repo, default_branch: defaultBranch };
+    const current = (await git(['symbolic-ref', '--quiet', 'HEAD'], top))?.trim() ?? null;
+    // Branches checked out in a linked worktree (porcelain lists the main working tree first). Names only, never paths.
+    const inWorktree = new Set();
+    const blocks = (await git(['worktree', 'list', '--porcelain'], top) || '').split('\n\n');
+    for (const block of blocks.slice(1)) {
+      const line = block.split('\n').find((l) => l.startsWith('branch '));
+      if (line) inWorktree.add(line.slice('branch '.length));
+    }
+    const candidates = [];
+    for (const line of refs.split('\n')) {
+      const [ref, sha, upstream, date] = line.split('\0');
+      if (!ref || !ref.startsWith('refs/heads/') || !sha || !date) continue;
+      const name = ref.slice('refs/heads/'.length);
+      if (name === defaultBranch || name.length > MAX_BRANCH_CHARS) continue;
+      const when = new Date(date);
+      if (Number.isNaN(when.getTime())) continue;
+      candidates.push({ ref, name, sha, upstream: upstream && upstream.startsWith('origin/') ? upstream : null, when });
+      if (candidates.length === MAX_BRANCHES) break;
+    }
+    const branches = [];
+    for (const c of candidates) {
+      const counts = await git(['rev-list', '--left-right', '--count', `${base}...${c.ref}`], top);
+      if (counts === null) break; // out of time: what was read so far is still true
+      const [behind, ahead] = counts.trim().split(/\s+/).map(Number);
+      if (!Number.isInteger(ahead) || !Number.isInteger(behind) || ahead === 0) continue;
+      branches.push({
+        name: c.name, head_sha: c.sha, upstream: c.upstream, ahead, behind,
+        last_commit_at: c.when.toISOString().replace('.000Z', 'Z'), worktree: inWorktree.has(c.ref), current: current === c.ref,
+      });
+    }
+    return { repo, default_branch: defaultBranch, branches };
+  }
+
+  /** The exact request of spec 4.4. Todos: none in v1 (Claude Code's task files have no documented format). */
+  function requestBody(client, sessionKey, state) {
+    return {
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'report_local_state', arguments: {
+        client, client_version: VERSION, session_key: sessionKey,
+        repo: state.repo, default_branch: state.default_branch,
+        branches: state.branches,
+        todos: [],
+      } },
+    };
+  }
+
+  /** One request to Biddle: { outcome, result? } with outcome ok | unauthorized | scope | off | refused | error. */
+  async function send(body, bearer) {
+    let res;
+    try {
+      res = await fetch(`${apiBase()}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${bearer}`, 'user-agent': `biddle-sync/${VERSION}` },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
+      });
+    } catch (err) {
+      return { outcome: 'error', why: err && err.name === 'TimeoutError' ? 'timed out' : 'network error' };
+    }
+    if (res.status === 401) return { outcome: 'unauthorized' };
+    if (res.status === 403) return { outcome: 'scope' };
+    let msg;
+    try {
+      msg = await res.json();
+    } catch {
+      return { outcome: 'error', why: `HTTP ${res.status}` };
+    }
+    // A tool Biddle does not list for this person (tracking off, or the policy) is an unknown tool.
+    // Agent access refused for the person or the workspace (the policy, the seat) is -32001.
+    if (msg && msg.error) return { outcome: msg.error.code === -32602 ? 'off' : msg.error.code === -32001 ? 'denied' : 'error', why: String(msg.error.message || '').slice(0, 200) };
+    const result = msg && msg.result && msg.result.structuredContent;
+    if (!result || typeof result !== 'object') return { outcome: 'error', why: `HTTP ${res.status}` };
+    if (result.code === 'repo_not_in_workspace') return { outcome: 'refused', result };
+    if (msg.result.isError) return { outcome: 'error', why: String(result.error || 'refused').slice(0, 200), result };
+    return { outcome: 'ok', result };
+  }
+
+  function newer(a, b) {
+    const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+    const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < 3; i += 1) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    return false;
+  }
+
+  /** Records what Biddle said: the skip cache, the back-off after a refused token, the latest hook version. */
+  function remember(repo, snapshotHash, answer) {
+    const now = Date.now();
+    const patch = { last: { at: new Date(now).toISOString(), outcome: answer.outcome } };
+    if (answer.result && typeof answer.result.sync_version === 'string' && answer.result.sync_version.length <= 40) patch.latest_version = answer.result.sync_version;
+    if (['unauthorized', 'scope', 'off', 'denied'].includes(answer.outcome)) patch.backoff_until = now + BACKOFF_MS;
+    if (answer.outcome === 'ok') {
+      patch.backoff_until = 0;
+      const state = readJson(statePath);
+      patch.sent = { ...(state.sent && typeof state.sent === 'object' ? state.sent : {}), [repo.toLowerCase()]: { hash: snapshotHash, at: now } };
+    }
+    if (answer.outcome === 'refused') writeJson(skipPath, { ...readJson(skipPath), [repo.toLowerCase()]: now + SKIP_MS });
+    updateState(patch);
+  }
+
+  const hashOf = (s) => crypto.createHash('sha256').update(s).digest('hex');
+
+  /** The hook's work (in the detached child, or in the foreground for --check and the tests). */
+  async function sync(client, cwd, sessionKey, opts) {
+    const t = token();
+    if (!t.token) return { outcome: t.error === 'mode' ? 'bad_mode' : 'no_token' };
+    const state = readJson(statePath);
+    if (!opts.force && typeof state.backoff_until === 'number' && state.backoff_until > Date.now()) return { outcome: 'backoff' };
+    const snap = await collect(cwd);
+    if (snap.skip) return { outcome: snap.skip, snap };
+    const key = snap.repo.toLowerCase();
+    const skip = readJson(skipPath);
+    if (!opts.force && typeof skip[key] === 'number' && skip[key] > Date.now()) return { outcome: 'skipped', snap };
+    const body = requestBody(client, sessionKey, snap);
+    const snapshotHash = hashOf(JSON.stringify(body.params.arguments.branches));
+    const last = state.sent && state.sent[key];
+    if (!opts.force && last && last.hash === snapshotHash && Date.now() - last.at < SAME_SNAPSHOT_MS) return { outcome: 'same', snap };
+    const answer = await send(body, t.token);
+    remember(snap.repo, snapshotHash, answer);
+    return { ...answer, snap };
+  }
+
+  async function readStdin() {
+    if (process.stdin.isTTY) return {};
+    return new Promise((resolve) => {
+      const chunks = [];
+      let size = 0;
+      const done = () => {
+        try {
+          const v = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          resolve(v !== null && typeof v === 'object' ? v : {});
+        } catch {
+          resolve({});
+        }
+      };
+      const timer = setTimeout(() => { process.stdin.destroy(); done(); }, 1000);
+      process.stdin.on('data', (c) => {
+        size += c.length;
+        if (size <= MAX_STDIN_BYTES) chunks.push(c);
+      });
+      process.stdin.on('end', () => { clearTimeout(timer); done(); });
+      process.stdin.on('error', () => { clearTimeout(timer); resolve({}); });
+    });
+  }
+
+  async function readSecret(prompt) {
+    if (!process.stdin.isTTY) {
+      const chunks = [];
+      for await (const c of process.stdin) chunks.push(c);
+      return Buffer.concat(chunks).toString('utf8').trim();
+    }
+    process.stderr.write(prompt);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    return new Promise((resolve) => {
+      let value = '';
+      const onData = (buf) => {
+        for (const ch of buf.toString('utf8')) {
+          if (ch === '\r' || ch === '\n' || ch === '\u0004') {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            process.stdin.off('data', onData);
+            process.stderr.write('\n');
+            return resolve(value.trim());
+          }
+          if (ch === '\u0003') {
+            process.stdin.setRawMode(false);
+            process.stderr.write('\n');
+            process.exit(130);
+          }
+          if (ch === '\u007f' || ch === '\b') value = value.slice(0, -1);
+          else value += ch;
+        }
+      };
+      process.stdin.on('data', onData);
+    });
+  }
+
+  if (args.includes('--version')) {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
+
+  if (args.includes('--login')) {
+    const t = await readSecret(w.loginPrompt);
+    if (!TOKEN_PATTERN.test(t)) {
+      process.stderr.write(`${w.loginBad}\n`);
+      return 1;
+    }
+    writeJson(credentialsPath, { token: t });
+    fs.chmodSync(credentialsPath, 0o600);
+    updateState({ backoff_until: 0 });
+    process.stdout.write(`${w.loginSaved(credentialsPath)}\n`);
+    return 0;
+  }
+
+  if (args.includes('--check')) {
+    const cwd = path.resolve(argOf(args, '--cwd') || process.cwd());
+    const client = CLIENTS.includes(argOf(args, '--client')) ? argOf(args, '--client') : 'other';
+    const out = (s) => process.stdout.write(`${s}\n`);
+    out(`biddle-sync ${VERSION}`);
+    const t = token();
+    if (!t.token) {
+      out(t.error === 'mode' ? w.badMode(credentialsPath) : w.noToken);
+      return 1;
+    }
+    out(w.tokenOk(credentialsPath));
+    const r = await sync(client, cwd, hashOf(`check:${cwd}`).slice(0, 16), { force: true });
+    if (r.snap && r.snap.repo && r.snap.branches) out(w.repo(r.snap.repo, r.snap.default_branch, r.snap.branches.length));
+    const say = {
+      ok: () => w.sent(r.result), no_repo: () => w.noRepo, not_github: () => w.notGithub, no_base: () => w.noBase(r.snap.default_branch),
+      unauthorized: () => w.unauthorized, scope: () => w.scope, off: () => w.off, refused: () => w.refused, denied: () => w.denied(r.why),
+    }[r.outcome];
+    out(say ? say() : w.failed(r.why || r.outcome));
+    const latest = readJson(statePath).latest_version;
+    if (typeof latest === 'string' && newer(latest, VERSION)) out(client === 'claude-code' ? w.stale(latest) : w.staleOther(latest));
+    return r.outcome === 'ok' ? 0 : 1;
+  }
+
+  if (args.includes('--send')) {
+    const client = argOf(args, '--client');
+    const cwd = argOf(args, '--cwd');
+    const sessionKey = argOf(args, '--session-key');
+    if (!CLIENTS.includes(client) || !cwd || !sessionKey) return 0;
+    await sync(client, cwd, sessionKey, { force: false });
+    return 0;
+  }
+
+  // The hook. Only these keys of the hook's input are read: the session id (hashed here; the raw id never leaves this
+  // process), the working directory, and the event name. transcript_path is never read.
+  const client = argOf(args, '--client');
+  if (!CLIENTS.includes(client)) {
+    process.stderr.write(`${w.usage}\n`);
+    return 0;
+  }
+  const input = await readStdin();
+  const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
+  const cwdIn = typeof input.cwd === 'string' && input.cwd !== '' ? input.cwd : typeof roots[0] === 'string' ? roots[0] : process.cwd();
+  const session = typeof input.session_id === 'string' ? input.session_id : typeof input.conversation_id === 'string' ? input.conversation_id : 'none';
+  const sessionKey = hashOf(`session:${session}`).slice(0, 16);
+  const event = typeof input.hook_event_name === 'string' ? input.hook_event_name : '';
+  const cwd = path.resolve(cwdIn);
+
+  if (args.includes('--foreground')) {
+    await sync(client, cwd, sessionKey, { force: false });
+  } else {
+    const child = cp.spawn(process.execPath, [path.resolve(process.argv[1]), '--send', '--client', client, '--cwd', cwd, '--session-key', sessionKey], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    child.on('error', () => {});
+    child.unref();
+  }
+
+  // The stale-version notice (spec 2.2.3): once a day, on Claude Code's Stop, where a systemMessage reaches the person.
+  // Codex's Stop needs JSON on stdout at exit 0, so it gets an empty object; so does Cursor.
+  let reply = null;
+  if (client === 'claude-code' && event === 'Stop') {
+    const state = readJson(statePath);
+    const notified = typeof state.notified_at === 'number' ? state.notified_at : 0;
+    if (typeof state.latest_version === 'string' && newer(state.latest_version, VERSION) && Date.now() - notified > NOTICE_EVERY_MS) {
+      reply = { systemMessage: w.stale(state.latest_version) };
+      try {
+        updateState({ notified_at: Date.now() });
+      } catch {
+        reply = null;
+      }
+    }
+  }
+  if (reply) process.stdout.write(JSON.stringify(reply));
+  else if (client === 'codex' || client === 'cursor') process.stdout.write('{}');
+  return 0;
+}
+
+main().then(
+  (code) => { process.exitCode = code; },
+  () => { process.exitCode = process.argv.includes('--check') || process.argv.includes('--login') ? 1 : 0; },
+);

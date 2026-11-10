@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/biddle-sync --client claude-code 2>/dev/null || true", "timeout": 10 }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/biddle-sync --client claude-code 2>/dev/null || true", "timeout": 10 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/biddle-sync --client claude-code 2>/dev/null || true", "timeout": 10 }] }
+    ]
+  }
+}

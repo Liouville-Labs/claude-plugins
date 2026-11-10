@@ -1,0 +1,22 @@
+{
+  "name": "biddle",
+  "displayName": "Biddle",
+  "version": "0.1.0",
+  "description": "Keeps a private list of the work you ask your agent for, and where each piece stands in GitHub: Biddle's MCP server, the work-tracking skill, and a hook that reports your unmerged branches.",
+  "author": {
+    "name": "Biddle",
+    "url": "https://askbiddle.ai"
+  },
+  "homepage": "https://askbiddle.ai",
+  "repository": "https://github.com/Liouville-Labs/claude-plugins",
+  "license": "MIT",
+  "keywords": [
+    "biddle",
+    "action-items",
+    "github",
+    "mcp"
+  ],
+  "privacyPolicyUrl": "https://askbiddle.ai/privacy",
+  "termsOfServiceUrl": "https://askbiddle.ai/terms",
+  "documentationUrl": "https://github.com/Liouville-Labs/claude-plugins#readme"
+}

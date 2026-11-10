@@ -1,0 +1,12 @@
+{
+  "name": "askbiddle",
+  "owner": { "name": "Biddle", "url": "https://askbiddle.ai" },
+  "description": "Biddle's plugins for Claude Code.",
+  "plugins": [
+    {
+      "name": "biddle",
+      "source": "./claude-code",
+      "description": "A private list of the work you ask your agent for, and where each piece stands in GitHub."
+    }
+  ]
+}
